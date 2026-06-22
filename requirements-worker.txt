@@ -1,0 +1,17 @@
+# Minimal dependency set for a wigglewiggle hashing worker (`wigglewiggle.py serve`).
+# A worker only hashes image bytes it receives over the wire - it does NOT need
+# osxphotos, magic, or rich. Versions are pinned to match requirements.txt exactly
+# so perceptual hashes are bit-for-bit identical to whatever the orchestrator
+# would have computed locally.
+attrs==26.1.0
+cattrs==26.1.0
+cffi==2.0.0
+ImageHash==4.3.2
+numpy==2.4.6
+pillow==12.2.0
+pillow_heif==1.3.0
+pycparser==3.0
+PyWavelets==1.9.0
+scipy==1.17.1
+six==1.17.0
+typing_extensions==4.15.0
