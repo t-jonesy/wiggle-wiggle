@@ -145,12 +145,17 @@ cattrs.global_converter.register_structure_hook(HashSet, HashSet.__deserialize__
 class HashedImage:
     uid: str
     date: datetime
-    path: str = None
+    # These must be `| None`, not plain `str`: an iCloud photo whose full-res copy
+    # isn't local has no `path` (thumb only), so it's persisted as JSON null. cattrs
+    # coerces null into a plain `str` field via str(None) -> the truthy string
+    # "None" on restore, which then fools `best_version` into returning a path with
+    # no hashes. Keeping them Optional preserves None across the save/restore trip.
+    path: str | None = None
     hashes: HashSet = None
     _ios: bool = False
 
     # Sometimes it's easier to get a thumbnail.
-    thumb_path: str = None
+    thumb_path: str | None = None
     thumb_hashes: HashSet = None
 
     def _try_fetch_from_icloud(self, force_download: bool = False) -> None:
@@ -656,63 +661,77 @@ def run_hashes_on_directory(directory: str, workers=None, endpoints=None):
 # ---------------
 # WIGGLE DIVISION
 
-def find_wigglegrams(thresh: int) -> list[list[HashedImage]]:
+def find_wigglegrams(thresh: int, min_frames: int = 3) -> list[list[HashedImage]]:
     date_sorted = sorted(list(hashdb.values()), key=lambda x: x.date)
     wigglers = []
     this_wiggler = []
-
-    # Also do some statistics.
-    closest_non_zero_dist = None
-    furthest_dist = None
     this_average = 0
+
+    def flush():
+        # Close out the current run. An original plus its edited copy (white
+        # balance / lens-correction tweaks) differ by only a hair perceptually,
+        # so they group into a 2-pic "wiggle" that's really just one photo twice.
+        # Those aren't wigglegrams, so drop any run shorter than min_frames.
+        nonlocal this_wiggler, this_average
+        if len(this_wiggler) >= min_frames:
+            avg = this_average / len(this_wiggler)
+            print(f"Wiggle on {this_wiggler[0].date.isoformat()}... ran for {len(this_wiggler)} pics (avg dist {avg})")
+            wigglers.append(this_wiggler)
+        this_wiggler = []
+        this_average = 0
 
     for i in range(1, len(date_sorted)):
         # TODO: good way of specifying what hash to use
-        # also don't do extra work even if it's not much
-        path_current, hash_current = date_sorted[i].best_version()
-        path_last, hash_last = date_sorted[i - 1].best_version()
+        _, hash_current = date_sorted[i].best_version()
+        _, hash_last = date_sorted[i - 1].best_version()
 
         dist = hash_current.perceptual - hash_last.perceptual
-        if closest_non_zero_dist is None or closest_non_zero_dist > dist:
-            closest_non_zero_dist = dist
-        if furthest_dist is None or furthest_dist < dist:
-            furthest_dist = dist
-
-        if dist < thresh and dist > 0:
+        if 0 < dist < thresh:
             # Belongs in a wigglegram
             if len(this_wiggler) == 0:
-                print(f"Wiggle on {date_sorted[i - 1].date.isoformat()}... ", end="")
                 this_wiggler.append(date_sorted[i - 1])
             this_wiggler.append(date_sorted[i])
             this_average += dist
-        elif len(this_wiggler) > 0:
-            this_average /= len(this_wiggler)
-            print(f" ran for {len(this_wiggler)} pics (avg dist {this_average})")
-            wigglers.append(this_wiggler)
-            this_wiggler = []
-            this_average = 0
+        else:
+            flush()
 
-    if len(this_wiggler) > 0:
-        wigglers.append(this_wiggler)
-
-    # For autothresholding, someday
-    # print(f"close {closest_non_zero_dist}, far {furthest_dist}")
-
+    flush()
     return wigglers
 
-def make_wigglegram(filename: str, imgs: list[HashedImage], frame_duration: int = 100, max_size: int = 600, boomerang: bool = True, force_redownload: bool = False):
-    pillows = []
-
-    for img in imgs:
-        best_path, _ = img.best_version(force_redownload)
-        gottem = Image.open(best_path)
+def _open_frame(path: str, max_size: int, full_decode: bool) -> Image.Image:
+    try:
+        gottem = Image.open(path)
+        # thumbnail() resizes via JPEG draft mode (a fast DCT-scaled partial
+        # decode). For some otherwise-fine images that leaves the decoder in a
+        # state that raises a bogus "image file is truncated" at encode time;
+        # forcing a full decode first sidesteps draft entirely.
+        if full_decode:
+            gottem.load()
         gottem.thumbnail((max_size, max_size))
-        pillows.append(gottem)
+        # Flatten to a single-frame RGB image. Some sources (e.g. MPO burst/3D
+        # JPEGs) embed several images; save(save_all=True) would otherwise emit
+        # every embedded frame - including the un-resized full-size one - as extra
+        # GIF frames, which show up as jarring zoomed-in frames. convert() detaches
+        # a clean single frame at the thumbnail size and also forces the decode.
+        gottem = gottem.convert("RGB")
+    except Exception as e:
+        raise RuntimeError(f"bad frame {path}: {e}") from e
+    return gottem
 
-    if boomerang:
-        pillows = pillows + list(reversed(pillows))[1:]
+def make_wigglegram(filename: str, imgs: list[HashedImage], frame_duration: int = 100, max_size: int = 600, boomerang: bool = True, force_redownload: bool = False):
+    paths = [img.best_version(force_redownload)[0] for img in imgs]
 
-    pillows[0].save(filename, save_all=True, append_images=pillows[1:], duration=frame_duration, loop=0)
+    def build(full_decode: bool):
+        pillows = [_open_frame(p, max_size, full_decode) for p in paths]
+        if boomerang:
+            pillows = pillows + list(reversed(pillows))[1:]
+        pillows[0].save(filename, save_all=True, append_images=pillows[1:], duration=frame_duration, loop=0)
+
+    try:
+        # Fast path first; only the rare draft-mode casualties pay the full decode.
+        build(full_decode=False)
+    except OSError:
+        build(full_decode=True)
 
 def experiment_smooth_gradient():
     # Attempt to make a smooth transition between all the images in the database.
@@ -751,6 +770,7 @@ if __name__ == "__main__":
     parser.add_argument("--force-download", help="Forcibly download high-resolution images from iCloud, if missing locally.")
     parser.add_argument("--output", "-o", help="Output directory for wigglegrams.")
     parser.add_argument("--threshold", "-t", help="How similar an image must be to be considered a wigglegram.", type=int, default=10)
+    parser.add_argument("--min-frames", "-m", help="Skip image groups with fewer than this many pics (default: 3, drops original+edit pairs).", type=int, default=3)
     parser.add_argument("--jobs", "-j", help="Number of parallel worker processes for hashing (default: one per CPU core).", type=int, default=None)
     parser.add_argument("--remote", action="append", metavar="HOST:PORT", help="Use an already-running worker as extra cores. Repeatable.")
     parser.add_argument("--remote-ssh", action="append", metavar="USER@HOST", help="Start a worker on a remote box over SSH and use it. Repeatable.")
@@ -819,15 +839,28 @@ if __name__ == "__main__":
         output_dir = target_dir if args.output is None else args.output
         restore_db(target_dir)
 
-        all_found = find_wigglegrams(args.threshold)
+        all_found = find_wigglegrams(args.threshold, args.min_frames)
 
+        made = skipped = 0
         for wig in all_found:
             try_name = f"{output_dir}/wiggle_{wig[0].date.strftime('%Y-%m-%d_%H-%M-%S')}.gif"
             if os.path.exists(try_name):
                 # print("already exists")
                 continue
 
-            make_wigglegram(try_name, wig)
+            try:
+                make_wigglegram(try_name, wig)
+                made += 1
+            except Exception as e:
+                # A single corrupt/truncated source image shouldn't sink the whole
+                # export. Warn, drop any half-written gif (so we retry it next run
+                # instead of treating it as done), and keep going.
+                skipped += 1
+                print(f"skip wiggle {wig[0].date.isoformat()}: {e}")
+                if os.path.exists(try_name):
+                    os.remove(try_name)
+
+        print(f"Exported {made} wigglegrams, skipped {skipped}")
 
 
 
