@@ -21,18 +21,17 @@ import pillow_heif
 # '26 lem
 # gpl license (no warranty)
 
-# pip install ...
-# python -i wiggler.py
-# >>> do_hashes()
-# >>> wigs = find_wigglers()
-# >>> for w in wigs: make_wiggle(w)
-# ...or something like that
-
 # edit these!
-TMP_LOCATION = "/Volumes/ramdisk"
-OH_DAMN_OVERRIDE = "/Users/lem/Pictures/Photos Library.photoslibrary/originals"
+TMP_LOCATION = "/tmp"
 
 pillow_heif.register_heif_opener()
+
+# why isn't this default behavior
+def _fuck_dt_structure(obj: str, _) -> datetime:
+    return datetime.fromisoformat(obj)
+
+cattrs.global_converter.register_unstructure_hook(datetime, datetime.isoformat)
+cattrs.global_converter.register_structure_hook(datetime, _fuck_dt_structure)
 
 # --------------
 # IMAGE DIVISION
@@ -87,6 +86,7 @@ class HashSet:
     # @converter.register_unstructure_hook
     def __deserialize__(data: dict, cls):
         built = cls()
+        if data is None: return None
         if "p" in data: built.perceptual = imagehash.hex_to_hash(data["p"])
         if "a" in data: built.average = imagehash.hex_to_hash(data["a"])
         if "d" in data: built.difference = imagehash.hex_to_hash(data["d"])
@@ -124,7 +124,7 @@ class HashedImage:
         
         if pinfo.ismissing and force_download:
             tmp_name = f"{self.uid}.{pinfo.filename.split('.')[-1]}"
-            exp_res = osxphotos.PhotoExporter(img).export(TMP_LOCATION, filename=tmp_name, options=osxphotos.ExportOptions(download_missing=True))
+            exp_res = osxphotos.PhotoExporter(pinfo).export(TMP_LOCATION, filename=tmp_name, options=osxphotos.ExportOptions(download_missing=True))
             # Exporting forces a download anyway - better maybe to export to bitbucket and use official path?
             self.path = f"{TMP_LOCATION}/{tmp_name}"
         elif not pinfo.ismissing:
@@ -161,7 +161,7 @@ class HashedImage:
         loaded_img = Image.open(file)
         date_str = loaded_img.getexif().get(36867)
         if date_str is not None:
-            found_ctime = datetime.datetime.strptime(date_str, '%Y:%m:%d %H:%M:%S')
+            found_ctime = datetime.strptime(date_str, '%Y:%m:%d %H:%M:%S')
         else:
             found_ctime = datetime.fromtimestamp(os.path.getmtime(file))
 
@@ -175,7 +175,10 @@ class HashedImage:
 
         return built
 
-    def best_version(self):
+    def best_version(self, force_redownload: bool = False):
+        if self._ios and force_redownload:
+            self._try_fetch_from_icloud(True)
+
         if self.path: return self.path, self.hashes
         elif self.thumb_path: return self.thumb_path, self.thumb_hashes
         else: raise RuntimeError("No image!")
@@ -185,227 +188,255 @@ class HashedImage:
 # DATA DIVISION
 
 # All the hashes we know. It's a dict for some reason that I can't remember.
-hashdb = {}
+hashdb: dict[HashedImage] = {}
 
 def backup_db(root: str):
     with open(f"{root}/_hashes.json", "w") as hf:
-        hf.write(json.dumps(list(hashdb.items())))
+        hf.write(json.dumps([cattrs.unstructure(x) for x in hashdb.values()]))
 
 def restore_db(root: str):
     global hashdb
     with open(f"{root}/_hashes.json", "r") as hf:
         tmp_hashes = json.loads(hf.read())
     for itm in tmp_hashes:
-        hashdb[itm.uid] = itm
+        built = cattrs.structure(itm, HashedImage)
+        hashdb[built.uid] = built
 
+def run_hashes_on_icloud():
+    global hashdb
 
+    # iCloud mode.
+    target_dir = "/".join(_photodb.library_path.split("/")[:-1])
+    target_images = _photodb.query(osxphotos.QueryOptions(movies=False, hidden=False))
+    target_images.sort(key=lambda x: x.date)
 
+    try:
+        restore_db(target_dir)
+    except Exception as e:
+        pass
 
-def do_hashes():
-    global hashes
+    hash_added = 0
+    hash_error = 0
+    hash_found = 0
 
-    for i, img in enumerate(target_images):
-        print(f"{int(i/len(target_images)*100)}% {img.date.strftime("%Y-%m-%d %H:%M:%S")} {img.uuid}: ", end="")
-        actual_path = img.path
+    for img in target_images:
+        print(f"img \"{img.uuid}\": ", end="")
 
-        if str(img.uuid) in hashes.keys():
-            print(f"hash {str(hashes[img.uuid][2])} (cached)")
-            continue
-
-        if img.ismissing:
-            exp_res = osxphotos.PhotoExporter(img).export(TMP_LOCATION, options=osxphotos.ExportOptions(download_missing=True))
-            actual_path = TMP_LOCATION + "/" + img.original_filename
-
-        if not actual_path:
-            try:
-                print("trying ", end="")
-                actual_path = f"{OH_DAMN_OVERRIDE}/{img.directory}/{img.filename}"
-            except Exception as e:
-                try:
-                    print("nodir ", end="")
-                    actual_path = f"{OH_DAMN_OVERRIDE}/{img.filename[0]}/{img.filename}"
-
-                except Exception as f:
-                    print(e, f)
-                    breakpoint()
-                    continue
-
-        if not os.path.exists(actual_path):
-            print("not found!!!")
-            continue
-
-        if actual_path.endswith(".rw2"):
-            print("--raw--")
-            continue
-
-        try:
-            this_hash = imagehash.phash(Image.open(actual_path))
-            hashes[str(img.uuid)] = (str(img.uuid), img.date.isoformat(), str(this_hash))  # HashData(img.uuid, img.date, this_hash)
-        except Exception as e:
-            print(e)
-            # breakpoint()
-            continue
-
-        if actual_path.startswith(TMP_LOCATION):
-            print(f"hash {str(this_hash)} (downloaded)")
-            os.remove(actual_path)
+        if img.uuid in hashdb:
+            if hashdb[img.uuid].hashes is None and False:
+                # download and hash full images if that is missing
+                pass
+            else:
+                print("cached!")
+                hash_found += 1
         else:
-            print(f"hash {str(this_hash)}")
+            try:
+                built = HashedImage.from_ios(img, False)
+                hashdb[built.uid] = built
+                hash_added += 1
+                if built.hashes:
+                    print(f"added, phash {built.hashes.perceptual}")
+                else:
+                    print(f"added, phash {built.thumb_hashes.perceptual} (thumb)")
 
-        if i % 200 == 0:
-            print("backup...")
-            backup_db()
+                if hash_added % 100 == 0:
+                    backup_db(target_dir)
 
-def find_wigglers(thresh: int):
-    all_hashes = sorted(list(hashes.values()), key=lambda x: datetime.fromisoformat(x[1]))
-    inflated_hashes = []
+            except Exception as e:
+                print(f"huh? {e}")
+                hash_error += 1
 
+    backup_db(target_dir)
+    return hash_added, hash_found, hash_error
+
+def run_hashes_on_directory(directory: str):
+    global hashdb
+
+    # Directory mode.
+    # I promise the repetition here is clearer than trying to break this out into a class.
+    target_dir = directory
+    target_files = []
+
+    for file in glob.glob(f"{target_dir}/**/*", recursive=True):
+        if "image/" in magic.from_file(file, mime=True):
+            target_files.append(file)
+
+    try:
+        restore_db(target_dir)
+    except Exception as e:
+        pass
+
+    hash_added = 0
+    hash_error = 0
+    hash_found = 0
+
+    oof_db = [h.path for h in hashdb.values()]
+
+    for file in target_files:
+        print(f"img \"{file}\": ", end="")
+
+        if file in oof_db:
+            print("cached!")
+            hash_found += 1
+        else:
+            try:
+                built = HashedImage.from_file(file, False)
+                hashdb[built.uid] = built
+                oof_db.append(built.path)
+                hash_added += 1
+                print(f"added, phash {built.hashes.perceptual}")
+
+                if hash_added % 100 == 0:
+                    backup_db(target_dir)
+
+            except Exception as e:
+                print(f"huh? {e}")
+                hash_error += 1
+    
+    # Sorry
+    entries = sorted(list(hashdb.values()), key=lambda x: x.date)
+    hashdb = {}
+    for ent in entries:
+        hashdb[ent.uid] = ent
+
+    backup_db(target_dir)
+    return hash_added, hash_found, hash_error
+
+# ---------------
+# WIGGLE DIVISION
+
+def find_wigglegrams(thresh: int) -> list[list[HashedImage]]:
+    date_sorted = sorted(list(hashdb.values()), key=lambda x: x.date)
     wigglers = []
-    this_wiggle = []
+    this_wiggler = []
 
-    for h in all_hashes:
-        inflated_hashes.append({"uuid": h[0], "date": datetime.fromisoformat(h[1]), "hash": imagehash.hex_to_hash(h[2])})
+    # Also do some statistics.
+    closest_non_zero_dist = None
+    furthest_dist = None
+    this_average = 0
 
-    for i in range(1, len(inflated_hashes)):
-        distance = inflated_hashes[i]["hash"] - inflated_hashes[i - 1]["hash"]
-        if distance < thresh and distance > 0:
-            if len(this_wiggle) == 0:
-                print(f"Wiggle on {inflated_hashes[i]['date']}...", end="")
-                this_wiggle.append(inflated_hashes[i - 1])
-            this_wiggle.append(inflated_hashes[i])
-        elif len(this_wiggle) > 0:
-            print(f" ran for {len(this_wiggle)} pics")
-            wigglers.append(this_wiggle.copy())
-            this_wiggle = []
+    for i in range(1, len(date_sorted)):
+        # TODO: good way of specifying what hash to use
+        # also don't do extra work even if it's not much
+        path_current, hash_current = date_sorted[i].best_version()
+        path_last, hash_last = date_sorted[i - 1].best_version()
+
+        dist = hash_current.perceptual - hash_last.perceptual
+        if closest_non_zero_dist is None or closest_non_zero_dist > dist:
+            closest_non_zero_dist = dist
+        if furthest_dist is None or furthest_dist < dist:
+            furthest_dist = dist
+
+        if dist < thresh and dist > 0:
+            # Belongs in a wigglegram
+            if len(this_wiggler) == 0:
+                print(f"Wiggle on {date_sorted[i - 1].date.isoformat()}... ", end="")
+                this_wiggler.append(date_sorted[i - 1])
+            this_wiggler.append(date_sorted[i])
+            this_average += dist
+        elif len(this_wiggler) > 0:
+            this_average /= len(this_wiggler)
+            print(f" ran for {len(this_wiggler)} pics (avg dist {this_average})")
+            wigglers.append(this_wiggler)
+            this_wiggler = []
+            this_average = 0
+
+    if len(this_wiggler) > 0:
+        wigglers.append(this_wiggler)
+
+    # For autothresholding, someday
+    # print(f"close {closest_non_zero_dist}, far {furthest_dist}")
 
     return wigglers
 
-def make_wiggle(imgs: list):
-    # Export all the images first.
+def make_wigglegram(filename: str, imgs: list[HashedImage], frame_duration: int = 100, max_size: int = 600, boomerang: bool = True, force_redownload: bool = False):
     pillows = []
-    paths = []
-
-    try_name = f"wiggle_{imgs[0]['date'].strftime('%Y-%m-%d_%H-%M-%S')}.gif",
-    if os.path.exists(try_name):
-        print("skipping")
-        return
 
     for img in imgs:
-        info = _photodb.photos(uuid=[img["uuid"]])[0]
-        exp_res = osxphotos.PhotoExporter(info).export(TMP_LOCATION, options=osxphotos.ExportOptions(download_missing=True))
-        path = TMP_LOCATION + "/" + info.original_filename
-        paths.append(path)
-        gottem = Image.open(path)
-        gottem.thumbnail((600, 600))
+        best_path, _ = img.best_version(force_redownload)
+        gottem = Image.open(best_path)
+        gottem.thumbnail((max_size, max_size))
         pillows.append(gottem)
 
+    if boomerang:
+        pillows = pillows + list(reversed(pillows))[1:]
 
+    pillows[0].save(filename, save_all=True, append_images=pillows[1:], duration=frame_duration, loop=0)
 
-    pillows[0].save(try_name, save_all=True, append_images=pillows[1:] + list(reversed(pillows))[1:], duration=100, loop=0)
+def experiment_smooth_gradient():
+    # Attempt to make a smooth transition between all the images in the database.
+    # SLOW
+    options = list(hashdb.values())
+    smoothed = []
+    
+    smoothed.append(options.pop(0))
 
-    for p in paths:
-        os.remove(p)
+    while len(options) > 0:
+        current_deltas = []
+        path_current, hash_current = smoothed[-1].best_version()
+        for i, img in enumerate(options):
+            path_last, hash_last = img.best_version()
+            dist = hash_current.perceptual - hash_last.perceptual
+            current_deltas.append((dist, i, img))
 
+        current_deltas.sort(key=lambda x: x[0])
+        best = current_deltas[0]
+        smoothed.append(best[2])
+        del options[best[1]]
+
+    return smoothed
 
 if __name__ == "__main__":
     # let's fuckin go
-    parser = argparse.ArgumentParser(prog="./run_hashes.py", description="", epilog="")
+    parser = argparse.ArgumentParser(prog="wigglewiggle", description="", epilog="")
 
     parser_db = parser.add_mutually_exclusive_group(required=True)
     parser_db.add_argument("--icloud", "-i", action="store_true", help="Scan your iCloud photo library.")
     parser_db.add_argument("--directory", "-d", help="Scan a directory of pictures.")
 
-    parser.add_argument("action", choices=["hash", "list-wiggles", "export-wiggles"])
+    parser.add_argument("action", choices=["hash", "export"])
+    # Force download ain't done yet. Gotta experiment on hash/size relationship first
+    parser.add_argument("--force-download", help="Forcibly download high-resolution images from iCloud, if missing locally.")
+    parser.add_argument("--output", "-o", help="Output directory for wigglegrams.")
+    parser.add_argument("--threshold", "-t", help="How similar an image must be to be considered a wigglegram.", type=int, default=10)
 
     args = parser.parse_args()
 
     if args.icloud:
         # A bunch of things expect this.
         _photodb = osxphotos.PhotosDB()
+        target_dir = "/".join(_photodb.library_path.split("/")[:-1])
     else:
+        target_dir = args.directory
         pass
 
-        
     if args.action == "hash":
         # Unfortunately this needs special casing.
         if _photodb is not None:
-            # iCloud mode.
-            target_dir = "/".join(_photodb.library_path.split("/")[:-1])
-            target_images = _photodb.query(osxphotos.QueryOptions(movies=False, hidden=False))
-            target_images.sort(key=lambda x: x.date)
-
-            hash_added = 0
-            hash_error = 0
-            hash_found = 0
-
-            for img in target_images:
-                print(f"img \"{img.uuid}\": ", end="")
-
-                if img.uuid in hashdb:
-                    if hashdb[img.uuid].hashes is None and False:
-                        # download and hash full images if that is missing
-                        pass
-                    else:
-                        print("cached!")
-                        hash_found += 1
-                else:
-                    try:
-                        built = HashedImage.from_ios(img, False)
-                        hashdb[built.uid] = built
-                        hash_added += 1
-                        if built.hashes:
-                            print(f"added, phash {built.hashes.perceptual}")
-                        else:
-                            print(f"added, phash {built.thumb_hashes.perceptual} (thumb)")
-
-                        if hash_added % 100 == 0:
-                            backup_db(target_dir)
-
-                    except Exception as e:
-                        print(f"huh? {e}")
-                        hash_error += 1
+            hash_added, hash_found, hash_error = run_hashes_on_icloud()
         else:
-            # Directory mode.
-            # I promise the repetition here is clearer than trying to break this out into a class.
-            target_dir = args.directory
-            target_files = []
+            hash_added, hash_found, hash_error = run_hashes_on_directory(args.directory)
 
-            for file in glob.glob(f"{target_dir}/**/*", recursive=True):
-                if "image/" in magic.from_file(file):
-                    target_files.append(file)
-            
-            hash_added = 0
-            hash_error = 0
-            hash_found = 0
+        print(f"Found {hash_added + hash_found + hash_error} images - added {hash_added}, {hash_error} failed")
 
-            oof_db = [h.path for h in hashdb]
+    elif args.action == "export":
+        output_dir = target_dir if args.output is None else args.output
+        restore_db(target_dir)
 
-            for file in target_files:
-                print(f"img \"{file}\": ", end="")
+        all_found = find_wigglegrams(args.threshold)
 
-                if file in oof_db:
-                    print("cached!")
-                    hash_found += 1
-                else:
-                    try:
-                        built = HashedImage.from_file(file, False)
-                        hashdb[built.uid] = built
-                        oof_db.append(built.path)
-                        hash_added += 1
-                        print(f"added, phash {built.hashes.perceptual}")
+        for wig in all_found:
+            try_name = f"{output_dir}/wiggle_{wig[0].date.strftime('%Y-%m-%d_%H-%M-%S')}.gif"
+            if os.path.exists(try_name):
+                # print("already exists")
+                continue
 
-                        if hash_added % 100 == 0:
-                            backup_db(target_dir)
+            make_wigglegram(try_name, wig)
 
-                    except Exception as e:
-                        print(f"huh? {e}")
-                        hash_error += 1
-            
-            # Sorry
-            entries = sorted(list(hashdb.items()), key=lambda x: x.date)
-            hashdb = {}
-            for ent in entries:
-                hashdb[ent.uid] = ent
 
-        print(f"Found {hash_added + hash_found + hash_error} images - added {hash_added} new, {hash_error} failed")
-        backup_db(target_dir)
+
+
+
+
+
+
