@@ -718,14 +718,23 @@ def _open_frame(path: str, max_size: int, full_decode: bool) -> Image.Image:
         raise RuntimeError(f"bad frame {path}: {e}") from e
     return gottem
 
+# Per-format encoder options, keyed off the output extension. The format itself
+# is inferred by Pillow from the filename; webp/avif just want a quality knob and
+# compress an animation far smaller than gif (~8x for webp, ~30x for avif here).
+_SAVE_OPTS = {
+    "webp": {"quality": 80, "method": 4},
+    "avif": {"quality": 60},
+}
+
 def make_wigglegram(filename: str, imgs: list[HashedImage], frame_duration: int = 100, max_size: int = 600, boomerang: bool = True, force_redownload: bool = False):
     paths = [img.best_version(force_redownload)[0] for img in imgs]
+    save_opts = _SAVE_OPTS.get(os.path.splitext(filename)[1].lower().lstrip("."), {})
 
     def build(full_decode: bool):
         pillows = [_open_frame(p, max_size, full_decode) for p in paths]
         if boomerang:
             pillows = pillows + list(reversed(pillows))[1:]
-        pillows[0].save(filename, save_all=True, append_images=pillows[1:], duration=frame_duration, loop=0)
+        pillows[0].save(filename, save_all=True, append_images=pillows[1:], duration=frame_duration, loop=0, **save_opts)
 
     try:
         # Fast path first; only the rare draft-mode casualties pay the full decode.
@@ -771,6 +780,7 @@ if __name__ == "__main__":
     parser.add_argument("--output", "-o", help="Output directory for wigglegrams.")
     parser.add_argument("--threshold", "-t", help="How similar an image must be to be considered a wigglegram.", type=int, default=10)
     parser.add_argument("--min-frames", "-m", help="Skip image groups with fewer than this many pics (default: 3, drops original+edit pairs).", type=int, default=3)
+    parser.add_argument("--format", "-f", help="Output format for wigglegrams (default: gif). webp/avif are far smaller.", choices=["gif", "webp", "avif"], default="gif")
     parser.add_argument("--jobs", "-j", help="Number of parallel worker processes for hashing (default: one per CPU core).", type=int, default=None)
     parser.add_argument("--remote", action="append", metavar="HOST:PORT", help="Use an already-running worker as extra cores. Repeatable.")
     parser.add_argument("--remote-ssh", action="append", metavar="USER@HOST", help="Start a worker on a remote box over SSH and use it. Repeatable.")
@@ -843,7 +853,7 @@ if __name__ == "__main__":
 
         made = skipped = 0
         for wig in all_found:
-            try_name = f"{output_dir}/wiggle_{wig[0].date.strftime('%Y-%m-%d_%H-%M-%S')}.gif"
+            try_name = f"{output_dir}/wiggle_{wig[0].date.strftime('%Y-%m-%d_%H-%M-%S')}.{args.format}"
             if os.path.exists(try_name):
                 # print("already exists")
                 continue
