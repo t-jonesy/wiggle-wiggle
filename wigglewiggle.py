@@ -21,7 +21,7 @@ from concurrent.futures import ProcessPoolExecutor
 import attrs
 import cattrs
 import imagehash
-from PIL import Image
+from PIL import Image, ImageOps
 from PIL.ExifTags import Base
 import pillow_heif
 
@@ -57,6 +57,11 @@ except ImportError:
 TMP_LOCATION = "/tmp"
 
 pillow_heif.register_heif_opener()
+# Decode HEIC grids single-threaded. libheif farms grid tiles out to std::async
+# and waits on the futures; under sustained batch load that wait can deadlock
+# (main thread stuck in condition_variable::wait at 0% CPU forever). Serial tile
+# decode is a touch slower per image but removes the hanging code path entirely.
+pillow_heif.options.DECODE_THREADS = 1
 
 # why isn't this default behavior
 def _fuck_dt_structure(obj: str, _) -> datetime:
@@ -700,23 +705,33 @@ def find_wigglegrams(thresh: int, min_frames: int = 3) -> list[list[HashedImage]
 
 def _open_frame(path: str, max_size: int, full_decode: bool) -> Image.Image:
     try:
-        gottem = Image.open(path)
-        # thumbnail() resizes via JPEG draft mode (a fast DCT-scaled partial
-        # decode). For some otherwise-fine images that leaves the decoder in a
-        # state that raises a bogus "image file is truncated" at encode time;
-        # forcing a full decode first sidesteps draft entirely.
-        if full_decode:
-            gottem.load()
-        gottem.thumbnail((max_size, max_size))
-        # Flatten to a single-frame RGB image. Some sources (e.g. MPO burst/3D
-        # JPEGs) embed several images; save(save_all=True) would otherwise emit
-        # every embedded frame - including the un-resized full-size one - as extra
-        # GIF frames, which show up as jarring zoomed-in frames. convert() detaches
-        # a clean single frame at the thumbnail size and also forces the decode.
-        gottem = gottem.convert("RGB")
+        # `with` so the source file/decoder is closed promptly - over a few
+        # thousand frames, leaked HEIF handles otherwise pile up into GBs of RSS.
+        # convert() below returns an independent image, so closing the source is
+        # safe.
+        with Image.open(path) as gottem:
+            # thumbnail() resizes via JPEG draft mode (a fast DCT-scaled partial
+            # decode). For some otherwise-fine images that leaves the decoder in a
+            # state that raises a bogus "image file is truncated" at encode time;
+            # forcing a full decode first sidesteps draft entirely.
+            if full_decode:
+                gottem.load()
+            # Honor the EXIF orientation tag. Cameras store pixels in the sensor's
+            # native orientation plus a rotate/flip flag; PIL loads the raw pixels
+            # and ignores it, and gif/webp/avif don't carry the flag, so portrait
+            # shots would come out sideways. Bake the rotation into the pixels now.
+            # (No-op for orientation 1 - including HEIC, which pillow_heif already
+            # rotates - so the common case keeps the fast draft path below.)
+            gottem = ImageOps.exif_transpose(gottem)
+            gottem.thumbnail((max_size, max_size))
+            # Flatten to a single-frame RGB image. Some sources (e.g. MPO burst/3D
+            # JPEGs) embed several images; save(save_all=True) would otherwise emit
+            # every embedded frame - including the un-resized full-size one - as
+            # extra GIF frames, which show up as jarring zoomed-in frames. convert()
+            # detaches a clean single frame at the thumbnail size and forces decode.
+            return gottem.convert("RGB")
     except Exception as e:
         raise RuntimeError(f"bad frame {path}: {e}") from e
-    return gottem
 
 # Per-format encoder options, keyed off the output extension. The format itself
 # is inferred by Pillow from the filename; webp/avif just want a quality knob and
