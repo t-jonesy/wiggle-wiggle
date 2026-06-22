@@ -667,7 +667,14 @@ def run_hashes_on_directory(directory: str, workers=None, endpoints=None):
 # WIGGLE DIVISION
 
 def find_wigglegrams(thresh: int, min_frames: int = 3) -> list[list[HashedImage]]:
-    date_sorted = sorted(list(hashdb.values()), key=lambda x: x.date)
+    # Only consider frames backed by a full-resolution original. An entry with no
+    # local `path` (an iCloud photo not downloaded) can only render from its largest
+    # derivative, which is both small (frame-size mismatch with the real frames) and
+    # a render of any *edits* applied in Photos - jarring in a series. Full-res
+    # frames always use the unedited original master, so dropping the thumb-only
+    # ones leaves wigglegrams built purely from unmodified originals. Runs that fall
+    # below min_frames once these are gone get dropped by flush() below.
+    date_sorted = sorted((x for x in hashdb.values() if x.path), key=lambda x: x.date)
     wigglers = []
     this_wiggler = []
     this_average = 0
