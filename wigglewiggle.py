@@ -757,6 +757,21 @@ def make_wigglegram(filename: str, imgs: list[HashedImage], frame_duration: int 
     except OSError:
         build(full_decode=True)
 
+def _export_wiggle(job):
+    """Pool worker: build one wigglegram. Returns (made?, skip-message-or-None).
+    Cleans up its own half-written file on failure so a retry isn't fooled by it."""
+    filename, wig = job
+    try:
+        make_wigglegram(filename, wig)
+        return True, None
+    except Exception as e:
+        if os.path.exists(filename):
+            try:
+                os.remove(filename)
+            except OSError:
+                pass
+        return False, f"skip wiggle {wig[0].date.isoformat()}: {e}"
+
 def experiment_smooth_gradient():
     # Attempt to make a smooth transition between all the images in the database.
     # SLOW
@@ -866,24 +881,33 @@ if __name__ == "__main__":
 
         all_found = find_wigglegrams(args.threshold, args.min_frames)
 
-        made = skipped = 0
+        # Skip anything already on disk so a re-run resumes instead of redoing work.
+        # Also dedup by output name: two groups can start in the same second and map
+        # to the same file - keep the first (matches the old sequential behavior) so
+        # two pool workers never write the same path at once and corrupt it.
+        jobs = []
+        claimed = set()
         for wig in all_found:
             try_name = f"{output_dir}/wiggle_{wig[0].date.strftime('%Y-%m-%d_%H-%M-%S')}.{args.format}"
-            if os.path.exists(try_name):
-                # print("already exists")
+            if try_name in claimed or os.path.exists(try_name):
                 continue
+            claimed.add(try_name)
+            jobs.append((try_name, wig))
 
-            try:
-                make_wigglegram(try_name, wig)
-                made += 1
-            except Exception as e:
-                # A single corrupt/truncated source image shouldn't sink the whole
-                # export. Warn, drop any half-written gif (so we retry it next run
-                # instead of treating it as done), and keep going.
-                skipped += 1
-                print(f"skip wiggle {wig[0].date.isoformat()}: {e}")
-                if os.path.exists(try_name):
-                    os.remove(try_name)
+        # Each wigglegram is independent (decode a few frames, encode one file), so
+        # fan them out one per core - the decode/encode is CPU-bound and a single
+        # process leaves most of the machine idle. Workers inherit DECODE_THREADS=1,
+        # so we parallelize across images while each stays on libheif's serial
+        # (non-deadlocking) path. A corrupt image only sinks its own wigglegram.
+        made = skipped = 0
+        print(f"Building {len(jobs)} wigglegrams across {args.jobs or os.cpu_count()} cores...")
+        with ProcessPoolExecutor(max_workers=args.jobs) as pool:
+            for ok, msg in pool.map(_export_wiggle, jobs):
+                if ok:
+                    made += 1
+                else:
+                    skipped += 1
+                    print(msg)
 
         print(f"Exported {made} wigglegrams, skipped {skipped}")
 
