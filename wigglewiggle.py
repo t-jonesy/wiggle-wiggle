@@ -754,6 +754,13 @@ def make_wigglegram(filename: str, imgs: list[HashedImage], frame_duration: int 
 
     def build(full_decode: bool):
         pillows = [_open_frame(p, max_size, full_decode) for p in paths]
+        # Snap every frame to the first frame's dimensions. Shots with slightly
+        # different aspect ratios thumbnail to sizes that differ by a few pixels,
+        # which reads as a jitter in the loop - and avif/webp reject mismatched
+        # frame sizes outright. Resizing to a common size keeps the loop steady and
+        # the output encodable in any format.
+        target = pillows[0].size
+        pillows = [p if p.size == target else p.resize(target, Image.LANCZOS) for p in pillows]
         if boomerang:
             pillows = pillows + list(reversed(pillows))[1:]
         pillows[0].save(filename, save_all=True, append_images=pillows[1:], duration=frame_duration, loop=0, **save_opts)
