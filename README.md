@@ -30,6 +30,19 @@ Then run `export` to stitch the wigglegrams.
 ./wigglewiggle.py -i export    # build the gifs
 ```
 
+The `export` step takes a few knobs:
+
+* `-t/--threshold N` — how close two images have to be (perceptual hash distance) to count as part of the same wiggle. Lower is stricter. Default `10`.
+* `-m/--min-frames N` — drop runs shorter than `N` frames. Default `3`, which throws out the common "original + its edited copy" pairs: a white-balance or lens-correction tweak looks nearly identical to the original, so it otherwise sneaks in as a 2-pic "wiggle" that's really just one photo twice.
+* `-f/--format gif|webp|avif` — output format. Default `gif`, but `webp` and `avif` are *much* smaller for the same animation (roughly 8x and 30x here) if your viewer supports them.
+* `-o/--output DIR` — where to write the wigglegrams. Defaults to right next to your pictures.
+
+```
+./wigglewiggle.py -i export -f webp -m 4    # webp output, only runs of 4+ frames
+```
+
+If a source image is unreadable or truncated, `export` just skips that one wigglegram (cleaning up any half-written file) and keeps going, then prints how many it made vs. skipped. Re-running picks up where it left off — anything already exported is skipped.
+
 
 ### going faster
 
